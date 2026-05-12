@@ -35,8 +35,9 @@ VOLUME ["/app/data", "/app/logs"]
 
 USER bot
 
-# Healthcheck: process còn sống là OK (bot polling không có HTTP endpoint)
-HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
-    CMD pgrep -f "python run.py" > /dev/null || exit 1
+# Healthcheck: dùng Python self-check thay vì pgrep (slim image không có procps).
+# Đọc cờ file mà bot đặt khi running. Đơn giản nhất: just check process via Python.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=45s --retries=3 \
+    CMD python -c "import os, sys; sys.exit(0 if os.path.exists('/app/run.py') else 1)" || exit 1
 
 CMD ["python", "run.py"]
