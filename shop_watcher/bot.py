@@ -279,6 +279,56 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Super-admin only. Gửi message tới chat_id bất kỳ qua bot.
+
+    KHÔNG xuất hiện trong /help. Chỉ super_admin biết.
+    Cú pháp: /chat <chat_id> <message...>
+    """
+    settings: Settings = ctx.application.bot_data["settings"]
+    chat_id = update.effective_chat.id
+
+    # Nếu không phải super admin: giả vờ như command không tồn tại
+    # (cùng reply với on_unknown để khỏi leak sự tồn tại của /chat)
+    if (
+        settings.super_admin_chat_id is None
+        or chat_id != settings.super_admin_chat_id
+    ):
+        await update.effective_message.reply_text(
+            "Không hiểu lệnh. Gõ /help để xem hướng dẫn."
+        )
+        return
+
+    if not ctx.args or len(ctx.args) < 2:
+        await update.effective_message.reply_text(
+            "Cú pháp: /chat <chat_id|@channel> <message...>"
+        )
+        return
+
+    target_raw = ctx.args[0].strip()
+    message = " ".join(ctx.args[1:])
+
+    # Parse target
+    target: int | str
+    if target_raw.lstrip("-").isdigit():
+        target = int(target_raw)
+    else:
+        target = target_raw if target_raw.startswith("@") else f"@{target_raw}"
+
+    try:
+        sent = await ctx.application.bot.send_message(
+            chat_id=target,
+            text=message,
+            parse_mode="HTML",
+            disable_web_page_preview=False,
+        )
+        await update.effective_message.reply_text(
+            f"✅ Đã gửi (msg_id={sent.message_id}) tới {target}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        await update.effective_message.reply_text(f"❌ Gửi fail: {exc}")
+
+
 async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = ctx.application.bot_data["settings"]
     poller: Poller = ctx.application.bot_data["poller"]
@@ -475,6 +525,9 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("ls", cmd_list))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("check", cmd_check))
+
+    # Hidden super-admin command (KHÔNG add vào help text)
+    app.add_handler(CommandHandler("chat", cmd_chat))
 
     # Inline buttons
     app.add_handler(CallbackQueryHandler(on_callback))

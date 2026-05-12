@@ -39,6 +39,7 @@ class Settings:
     shopee_cookie: str | None = None
     shopee_cookies_json: str | None = None
     twocaptcha_api_key: str | None = None
+    super_admin_chat_id: int | None = None
 
     @classmethod
     def load(cls) -> "Settings":
@@ -67,6 +68,7 @@ class Settings:
             shopee_cookie=os.getenv("SHOPEE_COOKIE", "").strip() or None,
             shopee_cookies_json=os.getenv("SHOPEE_COOKIES_JSON", "").strip() or None,
             twocaptcha_api_key=os.getenv("TWOCAPTCHA_API_KEY", "").strip() or None,
+            super_admin_chat_id=int(_sa) if (_sa := os.getenv("SUPER_ADMIN_CHAT_ID", "").strip()).lstrip("-").isdigit() else None,
         )
 
 
