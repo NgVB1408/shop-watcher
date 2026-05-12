@@ -12,7 +12,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -44,6 +47,11 @@ class ShopeeScraper(ShopScraper):
 
     platform = "shopee"
 
+    # Cookie persistence (lưu vào /app/data/ để survive restart)
+    COOKIE_CACHE_FILE = Path(
+        os.getenv("DB_PATH", "data/shop_watcher.db")
+    ).parent / "shopee_cookies_live.json"
+
     def __init__(
         self,
         proxy: str | None = None,
@@ -57,6 +65,7 @@ class ShopeeScraper(ShopScraper):
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._init_lock = asyncio.Lock()
+        self._last_cookie_save = 0.0
 
     async def _ensure_context(self) -> BrowserContext:
         async with self._init_lock:
@@ -103,7 +112,28 @@ class ShopeeScraper(ShopScraper):
             return self._context
 
     def _load_cookies(self) -> list[dict[str, Any]]:
-        """Trả về list cookies format Playwright cần."""
+        """Trả về list cookies. Ưu tiên file cache (đã refresh runtime) > env.
+
+        Cache file được update sau mỗi poll → cookies luôn fresh nhất có thể.
+        Khi restart container, cache (trong volume /app/data) vẫn còn → không
+        rớt session.
+        """
+        # Cache file: cookies đã được Playwright refresh trong runtime trước
+        if self.COOKIE_CACHE_FILE.exists():
+            try:
+                age = time.time() - self.COOKIE_CACHE_FILE.stat().st_mtime
+                cached_raw = json.loads(self.COOKIE_CACHE_FILE.read_text(encoding="utf-8"))
+                # Cache có giá trị nếu < 7 ngày (cookie Shopee thường sống ~14 ngày)
+                if cached_raw and age < 7 * 24 * 3600:
+                    log.info(
+                        "Load %d cookies từ cache (refresh %dm trước)",
+                        len(cached_raw), int(age / 60),
+                    )
+                    return cached_raw
+                log.info("Cookie cache quá cũ (%dh) — dùng env", age / 3600)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Đọc cookie cache fail: %s — fallback env", exc)
+
         out: list[dict[str, Any]] = []
 
         # Ưu tiên SHOPEE_COOKIES_JSON (full format từ Chrome extension export)
@@ -147,7 +177,34 @@ class ShopeeScraper(ShopScraper):
                 })
         return out
 
+    async def _persist_cookies(self, force: bool = False) -> None:
+        """Lấy cookies hiện tại từ browser context, lưu vào file cache.
+
+        Throttle: chỉ ghi mỗi 60s (trừ khi force=True). Browser context
+        tự refresh cookies khi navigate → cookies trong context luôn mới
+        nhất so với env input.
+        """
+        if not self._context:
+            return
+        now = time.time()
+        if not force and (now - self._last_cookie_save) < 60:
+            return
+        try:
+            cookies = await self._context.cookies("https://shopee.vn")
+            if not cookies:
+                return
+            self.COOKIE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.COOKIE_CACHE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(cookies, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self.COOKIE_CACHE_FILE)
+            self._last_cookie_save = now
+            log.debug("Persisted %d cookies → %s", len(cookies), self.COOKIE_CACHE_FILE)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Persist cookies fail: %s", exc)
+
     async def close(self) -> None:
+        # Save trước khi đóng để không mất state
+        await self._persist_cookies(force=True)
         async with self._init_lock:
             try:
                 if self._context:
@@ -322,6 +379,9 @@ class ShopeeScraper(ShopScraper):
 
         await asyncio.sleep(3)
         await page.close()
+
+        # Persist cookies sau mỗi scrape — auto-refresh khỏi env-locked state
+        await self._persist_cookies()
 
         # Build Product
         out: list[Product] = []
