@@ -244,10 +244,16 @@ class ShopeeScraper(ShopScraper):
 
         items_raw: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
+        seen_api_urls: list[str] = []
         data_event = asyncio.Event()
 
         async def on_response(resp):
             url = resp.url
+            # Log mọi API call Shopee để debug
+            if "/api/" in url and "shopee" in url:
+                short = url.split("?")[0].split("/api/")[-1][:80]
+                seen_api_urls.append(short)
+
             if not any(p in url for p in _API_PATTERNS):
                 return
             try:
@@ -255,10 +261,8 @@ class ShopeeScraper(ShopScraper):
             except Exception:  # noqa: BLE001
                 return
 
-            # Format 1 (search_items, rcmd_items): top-level items[]
             found = data.get("items") or []
 
-            # Format 2 (recommend): data.sections[].data.item[] or item_cards
             if not found:
                 d = data.get("data") or {}
                 for sec in d.get("sections", []) or []:
@@ -272,7 +276,6 @@ class ShopeeScraper(ShopScraper):
                 info = it.get("item_basic") or it
                 iid = info.get("itemid")
                 if iid is None:
-                    # rcmd format: itemid trong item_card_displayed_asset hoặc item
                     iid = (info.get("item") or {}).get("itemid")
                 if iid is None:
                     continue
@@ -297,18 +300,25 @@ class ShopeeScraper(ShopScraper):
             await page.close()
             raise ScraperError(f"Không load được trang shop search: {exc}") from exc
 
-        # Đợi response API
         try:
-            await asyncio.wait_for(data_event.wait(), timeout=12)
+            await asyncio.wait_for(data_event.wait(), timeout=20)
         except asyncio.TimeoutError:
-            # Không bắt được response → check DOM xem có blocked không
             log.warning(
-                "[shop %s] Playwright không bắt được API response trong 12s", shop_id
+                "[shop %s] Playwright không bắt được API response trong 20s. "
+                "Shopee API URLs đã thấy (%d): %s",
+                shop_id,
+                len(seen_api_urls),
+                seen_api_urls[:15] if seen_api_urls else "(none)",
             )
+            # Check xem trang có captcha không
+            try:
+                content = await page.content()
+                if "captcha" in content.lower() or "verify" in content.lower():
+                    log.warning("[shop %s] Trang có CAPTCHA — cookies hết hạn?", shop_id)
+            except Exception:  # noqa: BLE001
+                pass
 
-        # Đợi thêm chút để các response trailing cũng vào
-        await asyncio.sleep(2)
-
+        await asyncio.sleep(3)
         await page.close()
 
         # Build Product
