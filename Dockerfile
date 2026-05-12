@@ -8,13 +8,11 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     TZ=Asia/Ho_Chi_Minh \
+    DEBIAN_FRONTEND=noninteractive \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        tzdata \
-    && ln -sf /usr/share/zoneinfo/$TZ /etc/localtime \
-    && echo $TZ > /etc/timezone \
-    && rm -rf /var/lib/apt/lists/*
+# Image base playwright/python đã có tzdata sẵn — chỉ set link timezone
+RUN ln -sf /usr/share/zoneinfo/$TZ /etc/localtime 2>/dev/null || true
 
 WORKDIR /app
 
