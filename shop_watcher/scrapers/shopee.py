@@ -71,8 +71,10 @@ class ShopeeScraper(ShopScraper):
                     "--disable-dev-shm-usage",
                 ],
             }
-            if self._proxy:
-                launch_kwargs["proxy"] = {"server": self._proxy}
+            proxy_cfg = _parse_proxy(self._proxy)
+            if proxy_cfg:
+                launch_kwargs["proxy"] = proxy_cfg
+                log.info("Playwright dùng proxy: %s", proxy_cfg.get("server"))
 
             self._browser = await self._pw.chromium.launch(**launch_kwargs)
             self._context = await self._browser.new_context(
@@ -394,6 +396,24 @@ class ShopeeScraper(ShopScraper):
 _SLUG_RE = re.compile(r"[^A-Za-z0-9]+")
 _SHOP_URL_RE = re.compile(r"shopee\.vn/shop/(\d+)", re.IGNORECASE)
 _ITEM_URL_RE = re.compile(r"-i\.(\d+)\.(\d+)", re.IGNORECASE)
+
+
+def _parse_proxy(raw: str | None) -> dict[str, Any] | None:
+    """Parse 'http://user:pass@host:port' → Playwright proxy config."""
+    if not raw:
+        return None
+    from urllib.parse import urlparse
+    p = urlparse(raw if "://" in raw else f"http://{raw}")
+    if not p.hostname:
+        return None
+    scheme = p.scheme or "http"
+    port = p.port or (1080 if scheme.startswith("socks") else 8080)
+    cfg: dict[str, Any] = {"server": f"{scheme}://{p.hostname}:{port}"}
+    if p.username:
+        cfg["username"] = p.username
+    if p.password:
+        cfg["password"] = p.password
+    return cfg
 
 
 def _slugify(text: str) -> str:

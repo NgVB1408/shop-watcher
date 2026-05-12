@@ -38,6 +38,7 @@ class Settings:
     http_proxy: str | None = None
     shopee_cookie: str | None = None
     shopee_cookies_json: str | None = None
+    twocaptcha_api_key: str | None = None
 
     @classmethod
     def load(cls) -> "Settings":
@@ -65,6 +66,7 @@ class Settings:
             http_proxy=os.getenv("HTTP_PROXY", "").strip() or None,
             shopee_cookie=os.getenv("SHOPEE_COOKIE", "").strip() or None,
             shopee_cookies_json=os.getenv("SHOPEE_COOKIES_JSON", "").strip() or None,
+            twocaptcha_api_key=os.getenv("TWOCAPTCHA_API_KEY", "").strip() or None,
         )
 
 
