@@ -27,10 +27,6 @@ def _parse_chat_ids(raw: str | None) -> set[int]:
     return out
 
 
-def _parse_bool(raw: str | None) -> bool:
-    return (raw or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
 @dataclass(frozen=True)
 class Settings:
     telegram_bot_token: str
@@ -41,9 +37,7 @@ class Settings:
     log_level: str = "INFO"
     http_proxy: str | None = None
     shopee_cookie: str | None = None
-    shopee_auto_cookie: bool = False
     shopee_cookies_json: str | None = None
-    shopee_use_browser: bool = False
 
     @classmethod
     def load(cls) -> "Settings":
@@ -61,10 +55,6 @@ class Settings:
         if not db_path.is_absolute():
             db_path = PROJECT_ROOT / db_path
 
-        proxy = os.getenv("HTTP_PROXY", "").strip() or None
-        shopee_cookie = os.getenv("SHOPEE_COOKIE", "").strip() or None
-        cookies_json = os.getenv("SHOPEE_COOKIES_JSON", "").strip() or None
-
         return cls(
             telegram_bot_token=token,
             allowed_chat_ids=_parse_chat_ids(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS")),
@@ -72,11 +62,9 @@ class Settings:
             items_per_check=items,
             db_path=db_path,
             log_level=os.getenv("LOG_LEVEL", "INFO").upper().strip(),
-            http_proxy=proxy,
-            shopee_cookie=shopee_cookie,
-            shopee_auto_cookie=_parse_bool(os.getenv("SHOPEE_AUTO_COOKIE")),
-            shopee_cookies_json=cookies_json,
-            shopee_use_browser=_parse_bool(os.getenv("SHOPEE_USE_BROWSER")),
+            http_proxy=os.getenv("HTTP_PROXY", "").strip() or None,
+            shopee_cookie=os.getenv("SHOPEE_COOKIE", "").strip() or None,
+            shopee_cookies_json=os.getenv("SHOPEE_COOKIES_JSON", "").strip() or None,
         )
 
 

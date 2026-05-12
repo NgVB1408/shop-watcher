@@ -1,29 +1,27 @@
-"""Shopee scraper.
+"""Shopee scraper qua Playwright headless + stealth.
 
-Strategy:
-1. Dùng curl_cffi (TLS fingerprint giả Chrome) - bypass Shopee anti-bot tốt nhất
-   trong các HTTP client.
-2. Hỗ trợ cookie injection qua Settings.shopee_cookie để pass qua bot check khi
-   IP residential bị Shopee flag (error 90309999).
-3. Optional: tự refresh cookie bằng Playwright headless khi enable
-   SHOPEE_AUTO_COOKIE=1.
+Approach của bot reference:
+1. Mở trang shop /shop/{id}/search → Shopee tự gọi internal API
+   (search_items hoặc rcmd_items) trong browser
+2. Hook page.on('response', ...) → bắt response JSON
+3. Browser session có cookies đầy đủ → bypass anti-bot
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from curl_cffi import requests as curl_requests
-from curl_cffi.requests import AsyncSession
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    async_playwright,
 )
 
 from .base import Product, ScraperError, ShopInfo, ShopScraper
@@ -32,333 +30,335 @@ log = logging.getLogger(__name__)
 
 
 BASE = "https://shopee.vn"
-IMPERSONATE = "chrome124"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
-# Error codes Shopee
-_ERR_ANTIBOT = 90309999
-_ERR_INVALID_USERNAME = 2003013
-
-
-def _build_headers(
-    referer: str | None = None, csrftoken: str | None = None
-) -> dict[str, str]:
-    h = {
-        "Accept": "application/json",
-        "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
-        "Referer": referer or BASE,
-        "X-Requested-With": "XMLHttpRequest",
-        "X-API-SOURCE": "pc",
-        "X-Shopee-Language": "vi",
-        "Origin": BASE,
-    }
-    if csrftoken:
-        h["X-CSRFToken"] = csrftoken
-    return h
-
-
-def _parse_cookie_string(raw: str) -> dict[str, str]:
-    """Parse 'k1=v1; k2=v2; ...' → dict."""
-    out: dict[str, str] = {}
-    for chunk in raw.split(";"):
-        chunk = chunk.strip()
-        if not chunk or "=" not in chunk:
-            continue
-        k, v = chunk.split("=", 1)
-        out[k.strip()] = v.strip()
-    return out
+# Endpoint Shopee gọi từ browser khi vào /shop/{id}/search
+_API_PATTERNS = ("search_items", "rcmd_items", "recommend")
 
 
 class ShopeeScraper(ShopScraper):
+    """Mở trang shop, intercept API response do Shopee tự gọi."""
+
     platform = "shopee"
 
     def __init__(
         self,
         proxy: str | None = None,
         cookie_string: str | None = None,
-        auto_cookie: bool = False,
+        cookies_json: str | None = None,
     ):
         self._proxy = proxy
         self._cookie_string = cookie_string
-        self._auto_cookie = auto_cookie
-        self._session: AsyncSession | None = None
-        self._warmed_up = False
-        self._cookie_refresh_lock = asyncio.Lock()
+        self._cookies_json = cookies_json
+        self._pw: Playwright | None = None
+        self._browser: Browser | None = None
+        self._context: BrowserContext | None = None
+        self._init_lock = asyncio.Lock()
 
-    async def _ensure_session(self) -> AsyncSession:
-        if self._session is None:
-            kwargs: dict[str, Any] = {"impersonate": IMPERSONATE}
+    async def _ensure_context(self) -> BrowserContext:
+        async with self._init_lock:
+            if self._context is not None:
+                return self._context
+            self._pw = await async_playwright().start()
+            launch_kwargs: dict[str, Any] = {
+                "headless": True,
+                "args": [
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            }
             if self._proxy:
-                kwargs["proxy"] = self._proxy
-            self._session = AsyncSession(**kwargs)
-            if self._cookie_string:
-                for k, v in _parse_cookie_string(self._cookie_string).items():
-                    self._session.cookies.set(k, v, domain=".shopee.vn")
-                log.debug("Loaded %d cookies từ config", len(self._cookie_string.split(";")))
-        return self._session
+                launch_kwargs["proxy"] = {"server": self._proxy}
+
+            self._browser = await self._pw.chromium.launch(**launch_kwargs)
+            self._context = await self._browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1366, "height": 768},
+                locale="vi-VN",
+                timezone_id="Asia/Bangkok",
+            )
+
+            cookies = self._load_cookies()
+            if cookies:
+                await self._context.add_cookies(cookies)
+                log.info("Playwright context: nạp %d cookies", len(cookies))
+            else:
+                log.warning("Playwright context: KHÔNG có cookie nào — dễ bị Shopee chặn")
+
+            # Stealth (optional): chỉ apply nếu lib có sẵn
+            try:
+                from playwright_stealth import Stealth  # type: ignore
+                self._stealth = Stealth()
+                log.info("playwright-stealth enabled")
+            except ImportError:
+                self._stealth = None
+                log.debug("playwright-stealth không cài, dùng default fingerprint")
+
+            return self._context
+
+    def _load_cookies(self) -> list[dict[str, Any]]:
+        """Trả về list cookies format Playwright cần."""
+        out: list[dict[str, Any]] = []
+
+        # Ưu tiên SHOPEE_COOKIES_JSON (full format từ Chrome extension export)
+        if self._cookies_json:
+            try:
+                raw = json.loads(self._cookies_json)
+                for c in raw:
+                    cookie = {
+                        "name": c["name"],
+                        "value": c["value"],
+                        "domain": c.get("domain", ".shopee.vn"),
+                        "path": c.get("path", "/"),
+                    }
+                    if "expirationDate" in c:
+                        cookie["expires"] = int(c["expirationDate"])
+                    if c.get("secure"):
+                        cookie["secure"] = True
+                    if c.get("httpOnly"):
+                        cookie["httpOnly"] = True
+                    ss = (c.get("sameSite") or "unspecified").capitalize()
+                    cookie["sameSite"] = ss if ss in ("Strict", "Lax", "None") else "None"
+                    out.append(cookie)
+                return out
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Parse SHOPEE_COOKIES_JSON fail: %s", exc)
+
+        # Fallback: SHOPEE_COOKIE string format `name=value;`
+        if self._cookie_string:
+            for chunk in self._cookie_string.split(";"):
+                chunk = chunk.strip()
+                if not chunk or "=" not in chunk:
+                    continue
+                k, v = chunk.split("=", 1)
+                out.append({
+                    "name": k.strip(),
+                    "value": v.strip(),
+                    "domain": ".shopee.vn",
+                    "path": "/",
+                    "secure": True,
+                    "sameSite": "Lax",
+                })
+        return out
 
     async def close(self) -> None:
-        if self._session:
-            await self._session.close()
-            self._session = None
-
-    async def _warm_up(self) -> None:
-        if self._warmed_up:
-            return
-        s = await self._ensure_session()
-
-        # Nếu user đã set cookie từ env: SKIP warm-up GET homepage.
-        # Vì response Set-Cookie sẽ ghi đè cookie session của user.
-        if self._cookie_string:
-            log.info(
-                "Skip warm-up (đã có SHOPEE_COOKIE, %d cookies)",
-                len(_parse_cookie_string(self._cookie_string)),
-            )
-            self._warmed_up = True
-            return
-
-        try:
-            await s.get(BASE, headers={"Referer": "https://www.google.com/"})
-            self._warmed_up = True
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Warm-up Shopee fail (vẫn tiếp tục): %s", exc)
-            self._warmed_up = True
+        async with self._init_lock:
+            try:
+                if self._context:
+                    await self._context.close()
+                if self._browser:
+                    await self._browser.close()
+                if self._pw:
+                    await self._pw.stop()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("Playwright close error: %s", exc)
+            self._context = None
+            self._browser = None
+            self._pw = None
 
     # ---------- public API ----------
 
     async def resolve_shop(self, handle: str) -> ShopInfo:
+        """Mở trang /shop/{id} hoặc /{username}, đọc title + URL final."""
         username, shop_id_hint = _parse_handle(handle)
 
-        if shop_id_hint and not username:
-            data = await self._get_shop_detail(shopid=shop_id_hint)
-            return self._build_shop_info(data, fallback_handle=shop_id_hint)
+        ctx = await self._ensure_context()
+        page = await ctx.new_page()
+        try:
+            if shop_id_hint:
+                target_url = f"{BASE}/shop/{shop_id_hint}"
+            else:
+                target_url = f"{BASE}/{username}"
 
-        if username:
-            data = await self._get_shop_detail(username=username)
-            return self._build_shop_info(data, fallback_handle=username)
+            shop_id: str | None = shop_id_hint
+            captured_shop_id: list[str] = []
 
-        raise ScraperError(f"Không parse được handle: {handle!r}")
+            async def on_response(resp):
+                # Bắt /api/v4/shop/get_shop_detail để confirm shop_id
+                if "shop/get_shop_detail" in resp.url:
+                    try:
+                        d = await resp.json()
+                        sd = d.get("data") or {}
+                        sid = str(sd.get("shopid") or "")
+                        if sid:
+                            captured_shop_id.append(sid)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            page.on("response", on_response)
+
+            try:
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as exc:  # noqa: BLE001
+                raise ScraperError(f"Không load được trang shop: {exc}") from exc
+
+            # Đợi tí cho Shopee gọi xong shop_detail
+            await asyncio.sleep(3)
+
+            if captured_shop_id:
+                shop_id = captured_shop_id[0]
+
+            # Nếu vẫn chưa có shop_id (chỉ có username) → parse URL hiện tại
+            if not shop_id:
+                cur = page.url
+                m = re.search(r"/shop/(\d+)", cur)
+                if m:
+                    shop_id = m.group(1)
+
+            if not shop_id:
+                raise ScraperError("Không xác định được shop_id từ URL hoặc API response")
+
+            # Lấy shop name từ title hoặc query selector
+            try:
+                name = await page.title()
+                # Title dạng "{Name} | Shopee Việt Nam" → lấy phần trước "|"
+                if "|" in name:
+                    name = name.split("|")[0].strip()
+            except Exception:  # noqa: BLE001
+                name = username or shop_id
+
+            return ShopInfo(
+                platform=self.platform,
+                shop_id=shop_id,
+                handle=username or shop_id,
+                name=name,
+                url=f"{BASE}/shop/{shop_id}",
+            )
+        finally:
+            await page.close()
 
     async def list_latest_items(
         self, shop_id: str, limit: int = 30
     ) -> list[Product]:
-        """Dùng /api/v4/recommend/recommend (Shopee đã deprecate search_items).
-
-        sort_type=2 → newest. Items nằm trong data.sections[].data.item[].
-        """
-        url = f"{BASE}/api/v4/recommend/recommend"
-        params = {
-            "bundle": "shop_page_product_tab_main",
-            "limit": max(1, min(100, limit)),
-            "offset": 0,
-            "section": "shop_page_product_tab_main_sec",
-            "sort_type": 2,  # 1=relevance, 2=newest
-            "shopid": shop_id,
-            "upstream": "pdp",
-        }
-        data = await self._get_json(
-            url,
-            params=params,
-            referer=f"{BASE}/shop/{shop_id}",
-        )
-
-        out: list[Product] = []
-        # Format 1: data.sections[].data.item[]
-        d = data.get("data") or {}
-        sections = d.get("sections") or []
-        raw_items: list[dict[str, Any]] = []
-        for sec in sections:
-            sec_data = sec.get("data") or {}
-            it = sec_data.get("item") or sec_data.get("items") or []
-            if isinstance(it, list):
-                raw_items.extend(it)
-
-        # Format 2 (fallback): data.items[] hoặc top-level items[]
-        if not raw_items:
-            raw_items = d.get("items") or data.get("items") or []
-
-        for raw in raw_items:
-            basic = raw.get("item_basic") or raw
+        ctx = await self._ensure_context()
+        page = await ctx.new_page()
+        if self._stealth:
             try:
-                out.append(self._build_product(basic, shop_id=shop_id))
+                await self._stealth.apply_stealth_async(page)
             except Exception as exc:  # noqa: BLE001
-                log.debug("Bỏ qua item parse fail: %s", exc)
+                log.debug("apply stealth fail: %s", exc)
 
-        # Sort by ctime desc (mới nhất đầu) - recommend có thể không sort sẵn
+        items_raw: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        data_event = asyncio.Event()
+
+        async def on_response(resp):
+            url = resp.url
+            if not any(p in url for p in _API_PATTERNS):
+                return
+            try:
+                data = await resp.json()
+            except Exception:  # noqa: BLE001
+                return
+
+            # Format 1 (search_items, rcmd_items): top-level items[]
+            found = data.get("items") or []
+
+            # Format 2 (recommend): data.sections[].data.item[] or item_cards
+            if not found:
+                d = data.get("data") or {}
+                for sec in d.get("sections", []) or []:
+                    sd = sec.get("data") or {}
+                    found.extend(sd.get("item") or sd.get("items") or sd.get("item_cards") or [])
+                if not found:
+                    cic = (d.get("centralize_item_card") or {})
+                    found = cic.get("item_cards") or []
+
+            for it in found:
+                info = it.get("item_basic") or it
+                iid = info.get("itemid")
+                if iid is None:
+                    # rcmd format: itemid trong item_card_displayed_asset hoặc item
+                    iid = (info.get("item") or {}).get("itemid")
+                if iid is None:
+                    continue
+                sid = str(iid)
+                if sid in seen_ids:
+                    continue
+                seen_ids.add(sid)
+                items_raw.append(info)
+
+            if items_raw:
+                data_event.set()
+
+        page.on("response", on_response)
+
+        try:
+            await page.goto(
+                f"{BASE}/shop/{shop_id}/search",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+        except Exception as exc:  # noqa: BLE001
+            await page.close()
+            raise ScraperError(f"Không load được trang shop search: {exc}") from exc
+
+        # Đợi response API
+        try:
+            await asyncio.wait_for(data_event.wait(), timeout=12)
+        except asyncio.TimeoutError:
+            # Không bắt được response → check DOM xem có blocked không
+            log.warning(
+                "[shop %s] Playwright không bắt được API response trong 12s", shop_id
+            )
+
+        # Đợi thêm chút để các response trailing cũng vào
+        await asyncio.sleep(2)
+
+        await page.close()
+
+        # Build Product
+        out: list[Product] = []
+        for info in items_raw[:limit]:
+            try:
+                out.append(self._build_product(info, shop_id=shop_id))
+            except Exception as exc:  # noqa: BLE001
+                log.debug("Parse item fail: %s", exc)
+
         out.sort(key=lambda p: p.ctime or 0, reverse=True)
         return out
 
-    # ---------- internals ----------
-
-    @retry(
-        reraise=True,
-        retry=retry_if_exception_type((curl_requests.RequestsError, ScraperError)),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=8),
-    )
-    async def _get_json(
-        self,
-        url: str,
-        params: dict[str, Any] | None = None,
-        referer: str | None = None,
-    ) -> dict[str, Any]:
-        await self._warm_up()
-        s = await self._ensure_session()
-        # Pull csrftoken từ cookie jar nếu Shopee có set
-        csrf = None
-        try:
-            for c in s.cookies.jar:
-                if c.name == "csrftoken":
-                    csrf = c.value
-                    break
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            resp = await s.get(url, params=params, headers=_build_headers(referer, csrftoken=csrf))
-        except curl_requests.RequestsError as exc:
-            log.warning("HTTP error calling %s: %s", url, exc)
-            raise
-
-        status = resp.status_code
-        text = resp.text or ""
-
-        if status == 403:
-            err_code = _extract_error_code(text)
-            if err_code == _ERR_ANTIBOT and self._auto_cookie:
-                log.warning("Shopee anti-bot 403, thử refresh cookies bằng Playwright")
-                refreshed = await self._refresh_cookies_via_browser()
-                if refreshed:
-                    raise ScraperError("Đã refresh cookies, retry…")  # tenacity sẽ retry
-            raise ScraperError(
-                "Shopee chặn request (403). Nếu IP bạn bị flag, set SHOPEE_COOKIE "
-                "(paste cookies từ browser thường đã login) hoặc HTTP_PROXY. "
-                f"tracking_id={_extract_tracking_id(text)}"
-            )
-        if status == 404:
-            raise ScraperError("Shop không tồn tại (404).")
-        if status >= 400:
-            raise ScraperError(f"Shopee API trả lỗi {status}: {text[:200]}")
-
-        try:
-            data = resp.json()
-        except (ValueError, TypeError) as exc:
-            raise ScraperError(f"Phản hồi không phải JSON: {exc}") from exc
-
-        err_code = data.get("error")
-        if err_code not in (None, 0):
-            msg = data.get("error_msg") or data.get("message") or "unknown"
-            raise ScraperError(f"Shopee báo lỗi {err_code}: {msg}")
-        return data
-
-    async def _refresh_cookies_via_browser(self) -> bool:
-        """Mở Chromium headless, vào homepage Shopee, copy cookies vào session.
-
-        Chỉ work nếu IP không bị block ở mức captcha. Trả True nếu lấy được
-        ít nhất 1 cookie SPC_*.
-        """
-        async with self._cookie_refresh_lock:
-            try:
-                from playwright.async_api import async_playwright
-            except ImportError:
-                log.error(
-                    "SHOPEE_AUTO_COOKIE=1 nhưng playwright chưa cài. "
-                    "Chạy: pip install playwright && playwright install chromium"
-                )
-                return False
-
-            try:
-                async with async_playwright() as p:
-                    browser = await p.chromium.launch(headless=True)
-                    ctx_opts: dict[str, Any] = {
-                        "locale": "vi-VN",
-                        "viewport": {"width": 1366, "height": 900},
-                    }
-                    if self._proxy:
-                        # Playwright proxy format khác curl_cffi
-                        ctx_opts["proxy"] = {"server": self._proxy}
-                    ctx = await browser.new_context(**ctx_opts)
-                    page = await ctx.new_page()
-                    await page.goto(
-                        BASE, wait_until="domcontentloaded", timeout=30000
-                    )
-                    await page.wait_for_timeout(2500)
-                    cookies = await ctx.cookies("https://shopee.vn")
-                    await browser.close()
-            except Exception as exc:  # noqa: BLE001
-                log.error("Playwright cookie refresh fail: %s", exc)
-                return False
-
-            if not cookies:
-                log.warning("Browser không lấy được cookie nào (có thể bị captcha)")
-                return False
-
-            s = await self._ensure_session()
-            count = 0
-            for c in cookies:
-                if c.get("name", "").startswith(("SPC_", "REC_", "_dd_")):
-                    s.cookies.set(
-                        c["name"],
-                        c.get("value", ""),
-                        domain=c.get("domain", ".shopee.vn"),
-                    )
-                    count += 1
-            log.info("Refreshed %d cookies từ browser", count)
-            self._warmed_up = True
-            return count > 0
-
-    async def _get_shop_detail(
-        self,
-        username: str | None = None,
-        shopid: str | None = None,
-    ) -> dict[str, Any]:
-        params: dict[str, Any] = {}
-        if username:
-            params["username"] = username
-        if shopid:
-            params["shopid"] = shopid
-        if not params:
-            raise ScraperError("get_shop_detail thiếu username/shopid")
-
-        url = f"{BASE}/api/v4/shop/get_shop_detail"
-        data = await self._get_json(url, params=params, referer=BASE)
-        shop_data = data.get("data")
-        if not shop_data or not shop_data.get("shopid"):
-            raise ScraperError(
-                "Không tìm thấy shop. Kiểm tra username hoặc shop_id."
-            )
-        return shop_data
-
-    def _build_shop_info(
-        self, data: dict[str, Any], fallback_handle: str
-    ) -> ShopInfo:
-        shop_id = str(data["shopid"])
-        username = data.get("account", {}).get("username") or fallback_handle
-        name = data.get("name") or username
-        return ShopInfo(
-            platform=self.platform,
-            shop_id=shop_id,
-            handle=username,
-            name=name,
-            url=f"{BASE}/{username}" if username else f"{BASE}/shop/{shop_id}",
+    def _build_product(self, info: dict[str, Any], shop_id: str) -> Product:
+        # Hỗ trợ cả format cũ (search_items) lẫn format mới (rcmd item_card)
+        item_id = info.get("itemid") or (info.get("item") or {}).get("itemid")
+        item_id = str(item_id)
+        name = (
+            info.get("name")
+            or (info.get("item_card_displayed_asset") or {}).get("name")
+            or ""
         )
 
-    def _build_product(
-        self, basic: dict[str, Any], shop_id: str
-    ) -> Product:
-        item_id = str(basic["itemid"])
-        name = basic.get("name", "")
+        # Price: search_items có price (raw * 100000). rcmd item_card có
+        # item_card_display_price.display_price.price (cũng raw * 100000)
+        price = None
+        price_max = None
+        if isinstance(info.get("price"), int):
+            price = info["price"] // 100_000
+        elif "item_card_display_price" in info:
+            dp = info["item_card_display_price"].get("display_price") or {}
+            raw = dp.get("price")
+            if isinstance(raw, int):
+                price = raw // 100_000
 
-        price_raw = basic.get("price")
-        price_max_raw = basic.get("price_max")
-        price = price_raw // 100_000 if isinstance(price_raw, int) else None
-        price_max = (
-            price_max_raw // 100_000 if isinstance(price_max_raw, int) else None
-        )
+        if isinstance(info.get("price_max"), int):
+            price_max = info["price_max"] // 100_000
 
-        image_hash = basic.get("image")
+        image_hash = info.get("image") or (
+            info.get("item_card_displayed_asset") or {}
+        ).get("image")
         image_url = (
             f"https://down-vn.img.susercontent.com/file/{image_hash}"
-            if image_hash
-            else None
+            if image_hash else None
+        )
+
+        sold = (
+            info.get("historical_sold")
+            or info.get("sold")
+            or (info.get("item_card_display_sold_count") or {}).get("historical_sold_count")
         )
 
         slug = _slugify(name) if name else "i"
@@ -373,81 +373,42 @@ class ShopeeScraper(ShopScraper):
             price_max=price_max,
             url=url,
             image_url=image_url,
-            stock=basic.get("stock"),
-            sold=basic.get("historical_sold") or basic.get("sold"),
-            ctime=basic.get("ctime"),
+            stock=info.get("stock"),
+            sold=sold,
+            ctime=info.get("ctime"),
         )
 
 
-# ---------- helpers ----------
+# ---------- helpers (copy từ shopee.py để không phụ thuộc) ----------
 
 _SLUG_RE = re.compile(r"[^A-Za-z0-9]+")
 _SHOP_URL_RE = re.compile(r"shopee\.vn/shop/(\d+)", re.IGNORECASE)
 _ITEM_URL_RE = re.compile(r"-i\.(\d+)\.(\d+)", re.IGNORECASE)
-# Mobile/affiliate share path: /product/{shopid}/{itemid}, /opaanlp/{shopid}/{itemid},
-# /universal-link/product/{shopid}/{itemid}, /m/{shopid}/{itemid}, etc.
-# Chấp nhận một segment alpha trước cặp 2 số nguyên ≥4 chữ số.
-_AFFILIATE_ITEM_RE = re.compile(
-    r"shopee\.vn/(?:universal-link/)?(?:product|opaanlp|m)/(\d{4,})/(\d{4,})",
-    re.IGNORECASE,
-)
-_TRACKING_RE = re.compile(r'"tracking_id"\s*:\s*"([^"]+)"')
-_ERROR_RE = re.compile(r'"error"\s*:\s*(\d+)')
-
-
-def _extract_error_code(text: str) -> int | None:
-    m = _ERROR_RE.search(text)
-    return int(m.group(1)) if m else None
-
-
-def _extract_tracking_id(text: str) -> str:
-    m = _TRACKING_RE.search(text)
-    return m.group(1) if m else "n/a"
 
 
 def _slugify(text: str) -> str:
     s = _SLUG_RE.sub("-", text.strip())
-    s = s.strip("-")[:80]
-    return s or "i"
+    return s.strip("-")[:80] or "i"
 
 
 def _parse_handle(raw: str) -> tuple[str | None, str | None]:
     s = raw.strip()
     if not s:
         raise ScraperError("Handle rỗng")
-
     if s.startswith(("http://", "https://", "shopee.vn/")):
         s = s if s.startswith("http") else "https://" + s
-
         m = _ITEM_URL_RE.search(s)
         if m:
             return None, m.group(1)
-
-        m = _AFFILIATE_ITEM_RE.search(s)
-        if m:
-            return None, m.group(1)
-
         m = _SHOP_URL_RE.search(s)
         if m:
             return None, m.group(1)
-
         parsed = urlparse(s)
         path = unquote(parsed.path).strip("/")
-        first = path.split("/")[0] if path else ""
-        # Các segment là route nội bộ Shopee, KHÔNG phải username.
-        reserved_routes = {
-            "product", "opaanlp", "universal-link", "m", "mall",
-            "search", "find", "user", "buyer", "shop",
-        }
-        if first and first.lower() not in reserved_routes:
-            return first, None
-        raise ScraperError(
-            f"Không parse được Shopee URL: {raw!r}. "
-            "URL có dạng /product/{shopid}/{itemid} hoặc /opaanlp/... cần "
-            "shopid/itemid hợp lệ."
-        )
-
+        username = path.split("/")[0] if path else ""
+        if username:
+            return username, None
+        raise ScraperError(f"Không parse được Shopee URL: {raw!r}")
     if s.isdigit() and len(s) >= 4:
         return None, s
-
     return s.lstrip("@"), None

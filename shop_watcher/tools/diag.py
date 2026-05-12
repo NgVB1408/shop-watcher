@@ -1,4 +1,4 @@
-"""Diagnostic: kiểm tra cấu hình + gọi thật Shopee API.
+"""Diagnostic: kiểm tra cấu hình + test scraper Playwright.
 
 Dùng:
     .venv\\Scripts\\python.exe -m shop_watcher.tools.diag
@@ -8,10 +8,11 @@ Dùng:
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 
 from shop_watcher.config import Settings, configure_logging
-from shop_watcher.scrapers.shopee import ShopeeScraper, _parse_cookie_string
+from shop_watcher.scrapers import get_scraper
 
 
 def _mask(s: str | None, keep: int = 6) -> str:
@@ -39,33 +40,35 @@ async def run(target: str) -> int:
     print(f"POLL_INTERVAL       : {settings.poll_interval_seconds}s")
     print(f"ITEMS_PER_CHECK     : {settings.items_per_check}")
     print(f"HTTP_PROXY          : {settings.http_proxy or '(none)'}")
-    print(f"SHOPEE_AUTO_COOKIE  : {settings.shopee_auto_cookie}")
-    print()
 
-    cookies = _parse_cookie_string(settings.shopee_cookie or "")
-    print(f"SHOPEE_COOKIE       : {len(cookies)} cookie(s)")
-    if cookies:
-        critical = {"SPC_F", "SPC_CLIENTID", "SPC_R_T_ID", "SPC_T_ID", "SPC_EC", "SPC_U", "csrftoken"}
-        present = sorted(set(cookies.keys()) & critical)
-        missing = sorted(critical - set(cookies.keys()))
-        print(f"  Critical có        : {present or '(none)'}")
-        print(f"  Critical thiếu     : {missing or '(none)'}")
-        print(f"  Tất cả cookie names: {sorted(cookies.keys())}")
-        for k, v in list(cookies.items())[:3]:
-            print(f"    - {k} = {_mask(v, 4)}")
+    cookie_count = 0
+    if settings.shopee_cookies_json:
+        try:
+            cookies = json.loads(settings.shopee_cookies_json)
+            cookie_count = len(cookies)
+            print(f"SHOPEE_COOKIES_JSON : {cookie_count} cookies (JSON format)")
+            critical = {"SPC_F", "SPC_CLIENTID", "SPC_R_T_ID", "SPC_T_ID", "SPC_EC", "SPC_U", "csrftoken"}
+            names = {c.get("name", "") for c in cookies}
+            present = sorted(names & critical)
+            missing = sorted(critical - names)
+            print(f"  Critical có        : {present or '(none)'}")
+            print(f"  Critical thiếu     : {missing or '(none)'}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"SHOPEE_COOKIES_JSON : ❌ JSON parse fail: {exc}")
+    elif settings.shopee_cookie:
+        names = [c.split("=", 1)[0].strip() for c in settings.shopee_cookie.split(";") if "=" in c]
+        cookie_count = len(names)
+        print(f"SHOPEE_COOKIE       : {cookie_count} cookies (string format)")
+        print(f"  Names              : {names}")
     else:
-        print("  ⚠️ Chưa set cookie — nếu IP bị Shopee flag sẽ 403.")
+        print("⚠️ Chưa có cookie nào — Shopee có thể chặn request.")
     print()
 
     print("=" * 60)
-    print(f"TEST API với target: {target}")
+    print(f"TEST scraper với target: {target}")
     print("=" * 60)
 
-    scraper = ShopeeScraper(
-        proxy=settings.http_proxy,
-        cookie_string=settings.shopee_cookie,
-        auto_cookie=settings.shopee_auto_cookie,
-    )
+    scraper = get_scraper("shopee", settings)
 
     try:
         print("\n[1/2] resolve_shop …")
@@ -78,11 +81,6 @@ async def run(target: str) -> int:
             print(f"     url     : {info.url}")
         except Exception as exc:
             print(f"   ✗ {type(exc).__name__}: {exc}")
-            print()
-            print("   → Nếu là 403/error 90309999: IP bị Shopee block.")
-            print("     • Copy cookies từ Chrome (DevTools > Application > Cookies > shopee.vn)")
-            print("     • Hoặc set HTTP_PROXY tới VPS sạch")
-            print("     • Hoặc deploy bot lên VPS")
             return 2
 
         shop_id = info.shop_id
@@ -94,15 +92,17 @@ async def run(target: str) -> int:
             for i in items[:5]:
                 print(f"     - {i.item_id} | {i.name[:60]}")
                 print(f"       {i.price_text} | sold={i.sold} | ctime={i.ctime}")
+            if not items:
+                print("   ⚠️ Không lấy được item nào — có thể browser chưa load xong "
+                      "hoặc Shopee chặn hoàn toàn.")
+                return 3
         except Exception as exc:
             print(f"   ✗ {type(exc).__name__}: {exc}")
             return 3
 
         print()
         print("=" * 60)
-        print("✅ TẤT CẢ OK — bot sẽ chạy được. Nếu bot vẫn báo lỗi:")
-        print("   1. Đảm bảo đã RESTART bot sau khi sửa .env")
-        print("   2. Gõ /check trên Telegram để force poll ngay")
+        print("✅ TẤT CẢ OK — bot sẽ chạy được.")
         print("=" * 60)
         return 0
     finally:
