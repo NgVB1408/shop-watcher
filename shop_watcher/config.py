@@ -48,7 +48,7 @@ class Settings:
                 "TELEGRAM_BOT_TOKEN không được set. Copy .env.example -> .env và điền token."
             )
 
-        poll = max(30, int(os.getenv("POLL_INTERVAL_SECONDS", "300")))
+        poll = max(15, int(os.getenv("POLL_INTERVAL_SECONDS", "60")))
         items = max(5, min(100, int(os.getenv("ITEMS_PER_CHECK", "30"))))
 
         db_path_str = os.getenv("DB_PATH", "data/shop_watcher.db").strip()
