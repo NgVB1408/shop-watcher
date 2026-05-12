@@ -1,0 +1,29 @@
+services:
+  shop-watcher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: shop-watcher
+    restart: unless-stopped
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_ALLOWED_CHAT_IDS: ${TELEGRAM_ALLOWED_CHAT_IDS:-}
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-300}
+      ITEMS_PER_CHECK: ${ITEMS_PER_CHECK:-30}
+      DB_PATH: /app/data/shop_watcher.db
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      SHOPEE_COOKIE: ${SHOPEE_COOKIE:-}
+      SHOPEE_AUTO_COOKIE: "0"
+    volumes:
+      - shop-watcher-data:/app/data
+      - shop-watcher-logs:/app/logs
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  shop-watcher-data:
+  shop-watcher-logs:
