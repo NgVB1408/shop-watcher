@@ -351,36 +351,97 @@ class ShopeeScraper(ShopScraper):
 
         try:
             await page.goto(
-                f"{BASE}/shop/{shop_id}/search",
+                f"{BASE}/shop/{shop_id}",
                 wait_until="domcontentloaded",
                 timeout=30000,
             )
         except Exception as exc:  # noqa: BLE001
             await page.close()
-            raise ScraperError(f"Không load được trang shop search: {exc}") from exc
+            raise ScraperError(f"Không load được trang shop: {exc}") from exc
 
+        # ÉP gọi API recommend trực tiếp với sort_type=2 (newest) + cache-bust
+        # → bỏ qua mọi cache, lấy items mới nhất thật sự
         try:
-            await asyncio.wait_for(data_event.wait(), timeout=20)
-        except asyncio.TimeoutError:
-            log.warning(
-                "[shop %s] Playwright không bắt được API response trong 20s. "
-                "Shopee API URLs đã thấy (%d): %s",
+            api_data = await page.evaluate(
+                """async (shopId) => {
+                    const ts = Date.now();
+                    const url = `https://shopee.vn/api/v4/recommend/recommend?` +
+                        `bundle=shop_page_product_tab_main&limit=30&offset=0&` +
+                        `section=shop_page_product_tab_main_sec&sort_type=2&` +
+                        `shopid=${shopId}&_t=${ts}`;
+                    try {
+                        const r = await fetch(url, {
+                            credentials: 'include',
+                            headers: {
+                                'X-API-SOURCE': 'pc',
+                                'X-Shopee-Language': 'vi',
+                                'X-Requested-With': 'XMLHttpRequest',
+                            }
+                        });
+                        return { status: r.status, body: await r.json() };
+                    } catch (e) {
+                        return { status: 0, error: e.message };
+                    }
+                }""",
                 shop_id,
-                len(seen_api_urls),
-                seen_api_urls[:15] if seen_api_urls else "(none)",
             )
-            # Check xem trang có captcha không
-            try:
-                content = await page.content()
-                if "captcha" in content.lower() or "verify" in content.lower():
-                    log.warning("[shop %s] Trang có CAPTCHA — cookies hết hạn?", shop_id)
-            except Exception:  # noqa: BLE001
-                pass
 
-        await asyncio.sleep(3)
+            if api_data and api_data.get("status") == 200:
+                body = api_data.get("body") or {}
+                d = body.get("data") or {}
+                api_items: list[dict[str, Any]] = []
+                for sec in d.get("sections", []) or []:
+                    sd = sec.get("data") or {}
+                    api_items.extend(
+                        sd.get("item") or sd.get("items") or sd.get("item_cards") or []
+                    )
+                if not api_items:
+                    cic = d.get("centralize_item_card") or {}
+                    api_items = cic.get("item_cards") or []
+
+                for it in api_items:
+                    info = it.get("item_basic") or it
+                    iid = info.get("itemid") or (info.get("item") or {}).get("itemid")
+                    if iid is None:
+                        continue
+                    sid = str(iid)
+                    if sid in seen_ids:
+                        continue
+                    seen_ids.add(sid)
+                    items_raw.append(info)
+                log.info(
+                    "[shop %s] Direct API fetch: %d items (sort_type=2/newest)",
+                    shop_id, len(api_items),
+                )
+            else:
+                log.warning(
+                    "[shop %s] Direct API fetch fail: %s",
+                    shop_id,
+                    api_data.get("status") if api_data else "no_response",
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[shop %s] Direct API call lỗi: %s", shop_id, exc)
+
+        # Fallback: nếu direct API fail, đợi page trigger API tự nhiên
+        if not items_raw:
+            try:
+                await asyncio.wait_for(data_event.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                log.warning(
+                    "[shop %s] Cũng không bắt được API tự nhiên trong 15s. URLs: %s",
+                    shop_id,
+                    seen_api_urls[:10] if seen_api_urls else "(none)",
+                )
+                try:
+                    content = await page.content()
+                    if "captcha" in content.lower() or "verify" in content.lower():
+                        log.warning("[shop %s] Trang có CAPTCHA", shop_id)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        await asyncio.sleep(2)
         await page.close()
 
-        # Persist cookies sau mỗi scrape — auto-refresh khỏi env-locked state
         await self._persist_cookies()
 
         # Build Product
