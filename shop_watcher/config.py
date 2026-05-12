@@ -42,6 +42,8 @@ class Settings:
     http_proxy: str | None = None
     shopee_cookie: str | None = None
     shopee_auto_cookie: bool = False
+    shopee_cookies_json: str | None = None
+    shopee_use_browser: bool = False
 
     @classmethod
     def load(cls) -> "Settings":
@@ -51,7 +53,7 @@ class Settings:
                 "TELEGRAM_BOT_TOKEN không được set. Copy .env.example -> .env và điền token."
             )
 
-        poll = max(60, int(os.getenv("POLL_INTERVAL_SECONDS", "300")))
+        poll = max(30, int(os.getenv("POLL_INTERVAL_SECONDS", "300")))
         items = max(5, min(100, int(os.getenv("ITEMS_PER_CHECK", "30"))))
 
         db_path_str = os.getenv("DB_PATH", "data/shop_watcher.db").strip()
@@ -61,6 +63,7 @@ class Settings:
 
         proxy = os.getenv("HTTP_PROXY", "").strip() or None
         shopee_cookie = os.getenv("SHOPEE_COOKIE", "").strip() or None
+        cookies_json = os.getenv("SHOPEE_COOKIES_JSON", "").strip() or None
 
         return cls(
             telegram_bot_token=token,
@@ -72,6 +75,8 @@ class Settings:
             http_proxy=proxy,
             shopee_cookie=shopee_cookie,
             shopee_auto_cookie=_parse_bool(os.getenv("SHOPEE_AUTO_COOKIE")),
+            shopee_cookies_json=cookies_json,
+            shopee_use_browser=_parse_bool(os.getenv("SHOPEE_USE_BROWSER")),
         )
 
 

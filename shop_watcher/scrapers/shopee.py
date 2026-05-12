@@ -384,6 +384,13 @@ class ShopeeScraper(ShopScraper):
 _SLUG_RE = re.compile(r"[^A-Za-z0-9]+")
 _SHOP_URL_RE = re.compile(r"shopee\.vn/shop/(\d+)", re.IGNORECASE)
 _ITEM_URL_RE = re.compile(r"-i\.(\d+)\.(\d+)", re.IGNORECASE)
+# Mobile/affiliate share path: /product/{shopid}/{itemid}, /opaanlp/{shopid}/{itemid},
+# /universal-link/product/{shopid}/{itemid}, /m/{shopid}/{itemid}, etc.
+# Chấp nhận một segment alpha trước cặp 2 số nguyên ≥4 chữ số.
+_AFFILIATE_ITEM_RE = re.compile(
+    r"shopee\.vn/(?:universal-link/)?(?:product|opaanlp|m)/(\d{4,})/(\d{4,})",
+    re.IGNORECASE,
+)
 _TRACKING_RE = re.compile(r'"tracking_id"\s*:\s*"([^"]+)"')
 _ERROR_RE = re.compile(r'"error"\s*:\s*(\d+)')
 
@@ -416,16 +423,29 @@ def _parse_handle(raw: str) -> tuple[str | None, str | None]:
         if m:
             return None, m.group(1)
 
+        m = _AFFILIATE_ITEM_RE.search(s)
+        if m:
+            return None, m.group(1)
+
         m = _SHOP_URL_RE.search(s)
         if m:
             return None, m.group(1)
 
         parsed = urlparse(s)
         path = unquote(parsed.path).strip("/")
-        username = path.split("/")[0] if path else ""
-        if username:
-            return username, None
-        raise ScraperError(f"Không parse được Shopee URL: {raw!r}")
+        first = path.split("/")[0] if path else ""
+        # Các segment là route nội bộ Shopee, KHÔNG phải username.
+        reserved_routes = {
+            "product", "opaanlp", "universal-link", "m", "mall",
+            "search", "find", "user", "buyer", "shop",
+        }
+        if first and first.lower() not in reserved_routes:
+            return first, None
+        raise ScraperError(
+            f"Không parse được Shopee URL: {raw!r}. "
+            "URL có dạng /product/{shopid}/{itemid} hoặc /opaanlp/... cần "
+            "shopid/itemid hợp lệ."
+        )
 
     if s.isdigit() and len(s) >= 4:
         return None, s
