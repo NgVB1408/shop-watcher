@@ -39,15 +39,21 @@ _ERR_ANTIBOT = 90309999
 _ERR_INVALID_USERNAME = 2003013
 
 
-def _build_headers(referer: str | None = None) -> dict[str, str]:
-    return {
+def _build_headers(
+    referer: str | None = None, csrftoken: str | None = None
+) -> dict[str, str]:
+    h = {
         "Accept": "application/json",
         "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
         "Referer": referer or BASE,
         "X-Requested-With": "XMLHttpRequest",
         "X-API-SOURCE": "pc",
         "X-Shopee-Language": "vi",
+        "Origin": BASE,
     }
+    if csrftoken:
+        h["X-CSRFToken"] = csrftoken
+    return h
 
 
 def _parse_cookie_string(raw: str) -> dict[str, str]:
@@ -99,6 +105,17 @@ class ShopeeScraper(ShopScraper):
         if self._warmed_up:
             return
         s = await self._ensure_session()
+
+        # Nếu user đã set cookie từ env: SKIP warm-up GET homepage.
+        # Vì response Set-Cookie sẽ ghi đè cookie session của user.
+        if self._cookie_string:
+            log.info(
+                "Skip warm-up (đã có SHOPEE_COOKIE, %d cookies)",
+                len(_parse_cookie_string(self._cookie_string)),
+            )
+            self._warmed_up = True
+            return
+
         try:
             await s.get(BASE, headers={"Referer": "https://www.google.com/"})
             self._warmed_up = True
@@ -168,8 +185,17 @@ class ShopeeScraper(ShopScraper):
     ) -> dict[str, Any]:
         await self._warm_up()
         s = await self._ensure_session()
+        # Pull csrftoken từ cookie jar nếu Shopee có set
+        csrf = None
         try:
-            resp = await s.get(url, params=params, headers=_build_headers(referer))
+            for c in s.cookies.jar:
+                if c.name == "csrftoken":
+                    csrf = c.value
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            resp = await s.get(url, params=params, headers=_build_headers(referer, csrftoken=csrf))
         except curl_requests.RequestsError as exc:
             log.warning("HTTP error calling %s: %s", url, exc)
             raise
