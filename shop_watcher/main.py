@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from pathlib import Path
 
 from telegram.ext import Application, ApplicationBuilder
 
@@ -14,9 +15,24 @@ from .poller import Poller
 log = logging.getLogger(__name__)
 
 
+def _heartbeat_path(settings: Settings) -> Path:
+    return settings.db_path.parent / ".heartbeat"
+
+
+def _write_heartbeat(settings: Settings) -> None:
+    try:
+        p = _heartbeat_path(settings)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.touch()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Heartbeat write fail: %s", exc)
+
+
 async def _on_startup(app: Application) -> None:
     settings: Settings = app.bot_data["settings"]
     poller: Poller = app.bot_data["poller"]
+
+    _write_heartbeat(settings)
 
     # Lên lịch poll định kỳ. first=10s để có baseline ngay sau khi start.
     app.job_queue.run_repeating(
@@ -24,6 +40,13 @@ async def _on_startup(app: Application) -> None:
         interval=settings.poll_interval_seconds,
         first=10,
         name="shop_poll",
+    )
+    # Heartbeat tick mỗi 30s — để healthcheck phân biệt bot sống vs treo
+    app.job_queue.run_repeating(
+        callback=_heartbeat_job,
+        interval=30,
+        first=5,
+        name="heartbeat",
     )
     log.info(
         "Scheduler đã chạy, interval=%ss",
@@ -56,10 +79,17 @@ async def _on_shutdown(app: Application) -> None:
 
 async def _poll_job(ctx) -> None:
     poller: Poller = ctx.application.bot_data["poller"]
+    settings: Settings = ctx.application.bot_data["settings"]
     try:
         await poller.run_once()
     except Exception:  # noqa: BLE001
         log.exception("Poll job crashed")
+    _write_heartbeat(settings)
+
+
+async def _heartbeat_job(ctx) -> None:
+    settings: Settings = ctx.application.bot_data["settings"]
+    _write_heartbeat(settings)
 
 
 def build_app(settings: Settings) -> Application:

@@ -35,9 +35,9 @@ VOLUME ["/app/data", "/app/logs"]
 
 USER bot
 
-# Healthcheck: dùng Python self-check thay vì pgrep (slim image không có procps).
-# Đọc cờ file mà bot đặt khi running. Đơn giản nhất: just check process via Python.
-HEALTHCHECK --interval=60s --timeout=10s --start-period=45s --retries=3 \
-    CMD python -c "import os, sys; sys.exit(0 if os.path.exists('/app/run.py') else 1)" || exit 1
+# Healthcheck: bot ghi heartbeat vào /app/data/.heartbeat sau mỗi lần poll.
+# File tồn tại + mtime trong vòng 2 phút = healthy.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=3 \
+    CMD python -c "import os,sys,time; p='/app/data/.heartbeat'; sys.exit(0 if os.path.exists(p) and (time.time() - os.path.getmtime(p)) < 180 else 1)"
 
 CMD ["python", "run.py"]
