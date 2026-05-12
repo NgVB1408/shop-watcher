@@ -141,17 +141,19 @@ class ShopeeScraper(ShopScraper):
     async def list_latest_items(
         self, shop_id: str, limit: int = 30
     ) -> list[Product]:
-        url = f"{BASE}/api/v4/search/search_items"
+        """Dùng /api/v4/recommend/recommend (Shopee đã deprecate search_items).
+
+        sort_type=2 → newest. Items nằm trong data.sections[].data.item[].
+        """
+        url = f"{BASE}/api/v4/recommend/recommend"
         params = {
-            "by": "ctime",
-            "fe_categoryids": "",
-            "order": "desc",
-            "page_type": "shop",
-            "scenario": "PAGE_SHOP_SEARCH",
-            "version": 2,
-            "shop_id": shop_id,
+            "bundle": "shop_page_product_tab_main",
             "limit": max(1, min(100, limit)),
-            "newest": 0,
+            "offset": 0,
+            "section": "shop_page_product_tab_main_sec",
+            "sort_type": 2,  # 1=relevance, 2=newest
+            "shopid": shop_id,
+            "upstream": "pdp",
         }
         data = await self._get_json(
             url,
@@ -159,14 +161,30 @@ class ShopeeScraper(ShopScraper):
             referer=f"{BASE}/shop/{shop_id}",
         )
 
-        items = data.get("items") or []
         out: list[Product] = []
-        for raw in items:
+        # Format 1: data.sections[].data.item[]
+        d = data.get("data") or {}
+        sections = d.get("sections") or []
+        raw_items: list[dict[str, Any]] = []
+        for sec in sections:
+            sec_data = sec.get("data") or {}
+            it = sec_data.get("item") or sec_data.get("items") or []
+            if isinstance(it, list):
+                raw_items.extend(it)
+
+        # Format 2 (fallback): data.items[] hoặc top-level items[]
+        if not raw_items:
+            raw_items = d.get("items") or data.get("items") or []
+
+        for raw in raw_items:
             basic = raw.get("item_basic") or raw
             try:
                 out.append(self._build_product(basic, shop_id=shop_id))
             except Exception as exc:  # noqa: BLE001
                 log.debug("Bỏ qua item parse fail: %s", exc)
+
+        # Sort by ctime desc (mới nhất đầu) - recommend có thể không sort sẵn
+        out.sort(key=lambda p: p.ctime or 0, reverse=True)
         return out
 
     # ---------- internals ----------
