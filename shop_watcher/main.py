@@ -28,11 +28,57 @@ def _write_heartbeat(settings: Settings) -> None:
         log.debug("Heartbeat write fail: %s", exc)
 
 
+async def _seed_shops_from_env(app: Application) -> None:
+    """Auto-add shop_ids từ env SEED_SHOPS=104274078,123456,... cho mỗi allowed chat.
+
+    Chỉ chạy 1 lần khi shop chưa có trong DB của chat đó.
+    """
+    import os
+    raw = os.getenv("SEED_SHOPS", "").strip()
+    if not raw:
+        return
+    settings: Settings = app.bot_data["settings"]
+    db = app.bot_data["db"]
+    if not settings.allowed_chat_ids:
+        log.warning("SEED_SHOPS yêu cầu TELEGRAM_ALLOWED_CHAT_IDS để biết add cho ai")
+        return
+
+    from .scrapers import get_scraper
+    scraper = get_scraper("shopee", settings)
+    try:
+        for shop_part in raw.split(","):
+            shop_part = shop_part.strip()
+            if not shop_part:
+                continue
+            for chat_id in settings.allowed_chat_ids:
+                try:
+                    info = await scraper.resolve_shop(shop_part)
+                    _, created = db.add_shop(
+                        chat_id=chat_id,
+                        platform=info.platform,
+                        shop_handle=info.handle,
+                        shop_id=info.shop_id,
+                        shop_name=info.name,
+                    )
+                    if created:
+                        log.info(
+                            "SEED: added shop %s (%s) cho chat %s",
+                            info.shop_id, info.name, chat_id,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("SEED fail cho %s: %s", shop_part, exc)
+    finally:
+        await scraper.close()
+
+
 async def _on_startup(app: Application) -> None:
     settings: Settings = app.bot_data["settings"]
     poller: Poller = app.bot_data["poller"]
 
     _write_heartbeat(settings)
+
+    # Auto-seed shops từ env (skip nếu shop đã tồn tại)
+    await _seed_shops_from_env(app)
 
     # Lên lịch poll định kỳ. first=10s để có baseline ngay sau khi start.
     app.job_queue.run_repeating(
