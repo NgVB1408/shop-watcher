@@ -28,6 +28,78 @@ def _write_heartbeat(settings: Settings) -> None:
         log.debug("Heartbeat write fail: %s", exc)
 
 
+async def _send_demo_product(app: Application) -> None:
+    """Sau seed: pick 1 shop random, scrape 1 sản phẩm random, gửi cho admin.
+
+    Mục đích: chứng minh end-to-end pipeline (scraper + Telegram noti) hoạt động.
+    Chỉ chạy 1 lần khi startup nếu env `SEND_DEMO_ON_STARTUP=1`.
+    """
+    import os, random
+    if not os.getenv("SEND_DEMO_ON_STARTUP", "").strip().lower() in {"1", "true", "yes"}:
+        return
+
+    settings: Settings = app.bot_data["settings"]
+    db = app.bot_data["db"]
+
+    if not settings.allowed_chat_ids:
+        return
+
+    admin = next(iter(settings.allowed_chat_ids))
+    all_shops = db.list_shops(admin)
+    if not all_shops:
+        log.warning("DEMO: chưa có shop nào trong DB")
+        return
+
+    shop = random.choice(all_shops)
+    log.info("DEMO: quét shop random %s (%s)", shop.shop_id, shop.shop_name)
+
+    from .scrapers import get_scraper
+    from .notifier import send_product_notification
+
+    scraper = get_scraper("shopee", settings)
+    try:
+        items = await scraper.list_latest_items(shop.shop_id, limit=10)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("DEMO scrape fail: %s", exc)
+        items = []
+    finally:
+        await scraper.close()
+
+    if not items:
+        try:
+            await app.bot.send_message(
+                chat_id=admin,
+                text=f"⚠️ Demo: scrape shop <b>{shop.shop_name}</b> không lấy được item nào.",
+                parse_mode="HTML",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    # Pick 1-2 sản phẩm ngẫu nhiên
+    sample = random.sample(items, min(2, len(items)))
+
+    try:
+        await app.bot.send_message(
+            chat_id=admin,
+            text=(
+                f"🔬 <b>Demo scrape</b> · shop random: <b>{shop.shop_name}</b>\n"
+                f"Scraper bắt {len(items)} items. Gửi {len(sample)} mẫu:"
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("DEMO header send fail: %s", exc)
+        return
+
+    for p in sample:
+        try:
+            ok = await send_product_notification(app.bot, admin, p, shop.shop_name)
+            log.info("DEMO sent item %s: %s", p.item_id, ok)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("DEMO send item %s fail: %s", p.item_id, exc)
+
+
 async def _seed_shops_from_env(app: Application) -> None:
     """Auto-add shop_ids từ env SEED_SHOPS=104274078,123456,... cho mỗi allowed chat.
 
@@ -79,6 +151,12 @@ async def _on_startup(app: Application) -> None:
 
     # Auto-seed shops từ env (skip nếu shop đã tồn tại)
     await _seed_shops_from_env(app)
+
+    # Demo: scrape + gửi 1 sản phẩm random cho admin (nếu SEND_DEMO_ON_STARTUP=1)
+    try:
+        await _send_demo_product(app)
+    except Exception:  # noqa: BLE001
+        log.exception("Demo send fail")
 
     # Lên lịch poll định kỳ. first=10s để có baseline ngay sau khi start.
     app.job_queue.run_repeating(
